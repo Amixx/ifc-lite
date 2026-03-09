@@ -2,8 +2,9 @@
 
 /**
  * Syncs the root release version to the highest workspace version found.
- * Run this after `changeset version` so the root package.json and Cargo
- * workspace version track the highest released workspace package.
+ * Run this after `changeset version` so the root package.json, Cargo
+ * workspace version, and internal Rust workspace dependency versions track
+ * the highest released workspace package.
  *
  * This does not rewrite individual workspace package versions. Changesets
  * owns those versions directly so packages can version independently.
@@ -77,6 +78,11 @@ function syncVersions() {
 
   cargoToml = cargoToml.replace(
     /(\[workspace\.package\][^\[]*version\s*=\s*")[^"]+(")/,
+    `$1${version}$2`
+  );
+
+  cargoToml = cargoToml.replace(
+    /(ifc-lite-(?:core|geometry|wasm)\s*=\s*\{\s*version\s*=\s*")[^"]+(")/g,
     `$1${version}$2`
   );
 
