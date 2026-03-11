@@ -22,6 +22,7 @@ import {
     RelationshipGraphBuilder,
     RelationshipType,
     QuantityType,
+    PropertyValueType,
 } from '@ifc-lite/data';
 import type { SpatialHierarchy, QuantityTable, PropertyValue } from '@ifc-lite/data';
 
@@ -1313,7 +1314,7 @@ function parsePropertyValue(propEntity: IfcEntity): { type: number; value: Prope
         default: {
             // IfcPropertySingleValue and fallback: [Name, Description, NominalValue, Unit]
             const nominalValue = attrs[2];
-            let type = 0;
+            let type: number = PropertyValueType.String;
             let value: PropertyValue = nominalValue as PropertyValue;
 
             // Handle typed values like IFCBOOLEAN(.T.), IFCREAL(1.5)
@@ -1321,20 +1322,32 @@ function parsePropertyValue(propEntity: IfcEntity): { type: number; value: Prope
                 const innerValue = nominalValue[1];
                 const typeName = String(nominalValue[0]).toUpperCase();
 
-                if (typeName.includes('BOOLEAN') || typeName.includes('LOGICAL')) {
-                    type = 2;
+                if (typeName.includes('BOOLEAN')) {
+                    type = PropertyValueType.Boolean;
                     value = innerValue === '.T.' || innerValue === true;
+                } else if (typeName.includes('LOGICAL')) {
+                    type = PropertyValueType.Logical;
+                    // Preserve .U. (unknown) as null; .T./.F. as boolean
+                    if (innerValue === '.U.' || innerValue === '.X.') {
+                        value = null;
+                    } else {
+                        value = innerValue === '.T.' || innerValue === true;
+                    }
                 } else if (typeof innerValue === 'number') {
-                    type = 1;
+                    if (Number.isInteger(innerValue)) {
+                        type = PropertyValueType.Integer;
+                    } else {
+                        type = PropertyValueType.Real;
+                    }
                     value = innerValue;
                 } else {
-                    type = 0;
+                    type = PropertyValueType.String;
                     value = String(innerValue);
                 }
             } else if (typeof nominalValue === 'number') {
-                type = 1;
+                type = Number.isInteger(nominalValue) ? PropertyValueType.Integer : PropertyValueType.Real;
             } else if (typeof nominalValue === 'boolean') {
-                type = 2;
+                type = PropertyValueType.Boolean;
             } else if (nominalValue !== null && nominalValue !== undefined) {
                 value = String(nominalValue);
             }
