@@ -25,8 +25,28 @@ import { convertCommand } from './commands/convert.js';
 import { diffCommand } from './commands/diff.js';
 import { validateCommand } from './commands/validate.js';
 import { bsddCommand } from './commands/bsdd.js';
+import { statsCommand } from './commands/stats.js';
+import { mutateCommand } from './commands/mutate.js';
+import { askCommand } from './commands/ask.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-const VERSION = '0.2.0';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function getVersion(): string {
+  try {
+    // Try to read from package.json (works in both src/ and dist/)
+    const pkgPath = join(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    return pkg.version ?? '0.4.0';
+  } catch {
+    return '0.4.0';
+  }
+}
+
+const VERSION = getVersion();
 
 const HELP = `
   ifc-lite v${VERSION} — BIM toolkit for the terminal
@@ -49,6 +69,9 @@ const HELP = `
     diff      <f1.ifc> <f2.ifc>                   Compare two IFC files
     validate  <file.ifc>                          Structural validation checks
     bsdd      <class|search|psets|qsets> <arg>     buildingSMART Data Dictionary lookup
+    stats     <file.ifc>                          Auto-calculated model KPIs and health check
+    mutate    <file.ifc> --id N --set P=V --out F  Modify properties/attributes and save
+    ask       <file.ifc> "<question>"            Natural language BIM queries
 
   Options:
     --help, -h       Show help
@@ -93,6 +116,9 @@ const HELP = `
     ifc-lite bsdd class IfcWall
     ifc-lite bsdd search "concrete wall"
     ifc-lite bsdd psets IfcWall
+    ifc-lite ask model.ifc "how many walls?"
+    ifc-lite ask model.ifc "window-wall ratio" --json
+    ifc-lite ask model.ifc "list materials" --explain
 
   Pipe-friendly:
     ifc-lite query model.ifc --type IfcWall --json | jq '.[].name'
@@ -170,6 +196,15 @@ async function main(): Promise<void> {
       break;
     case 'bsdd':
       await bsddCommand(commandArgs);
+      break;
+    case 'stats':
+      await statsCommand(commandArgs);
+      break;
+    case 'mutate':
+      await mutateCommand(commandArgs);
+      break;
+    case 'ask':
+      await askCommand(commandArgs);
       break;
     default:
       process.stderr.write(`Unknown command: ${command}\n`);
