@@ -460,19 +460,16 @@ impl BooleanClippingProcessor {
             if second_operand.ifc_type == IfcType::IfcPolygonalBoundedHalfSpace {
                 let (plane_point, plane_normal, agreement) =
                     self.parse_half_space_solid(&second_operand, decoder)?;
-                if let Ok(bound_mesh) = self.build_polygonal_bounded_half_space_mesh(
-                    &second_operand,
-                    decoder,
-                    &mesh,
-                    plane_normal,
-                    agreement,
-                ) {
-                    let clipper = ClippingProcessor::new();
-                    if let Ok(clipped) = clipper.subtract_mesh(&mesh, &bound_mesh) {
-                        return Ok(clipped);
-                    }
-                }
 
+                // NOTE:
+                // PolygonalBoundedHalfSpace subtraction via CSG can trigger unrecoverable
+                // stack overflow on malformed/edge-case exports (observed on the svira
+                // 50 MB demo model, wall #5355896). This path runs inside WASM where
+                // stack overflow aborts parsing.
+                //
+                // Fall back to robust plane clipping for stability. This can over-clip
+                // compared to bounded subtraction, but preserves parser reliability and
+                // avoids crashing the whole model load.
                 return self.clip_mesh_with_half_space(&mesh, plane_point, plane_normal, agreement);
             }
 
