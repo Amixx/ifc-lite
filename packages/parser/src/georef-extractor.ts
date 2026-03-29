@@ -33,6 +33,22 @@ export interface MapConversion {
   scale?: number;            // Scale factor
 }
 
+/**
+ * Compute angle to grid north from XAxisAbscissa and XAxisOrdinate (in degrees).
+ * Returns the counterclockwise angle from map X to the IFC local X-axis.
+ * With IfcMapConversion this is represented as cos/sin, so:
+ * - XAxisAbscissa = cos(angle)
+ * - XAxisOrdinate = sin(angle)
+ */
+export function computeAngleToGridNorth(
+  xAxisAbscissa?: number,
+  xAxisOrdinate?: number
+): number | null {
+  if (xAxisAbscissa === undefined || xAxisOrdinate === undefined) return null;
+  const radians = Math.atan2(xAxisOrdinate, xAxisAbscissa);
+  return radians * (180 / Math.PI);
+}
+
 export interface ProjectedCRS {
   id: number;
   name: string;
@@ -261,4 +277,3 @@ export function getCoordinateSystemDescription(georef: GeoreferenceInfo): string
 
   return parts.join(' ');
 }
-

@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { IfcParser, type IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView, Mutation } from '@ifc-lite/mutations';
 import { PropertyValueType } from '@ifc-lite/data';
+import { isValidIfcGuid } from '@ifc-lite/encoding';
 import { MutablePropertyView as LiveMutablePropertyView } from '@ifc-lite/mutations';
 import { StepExporter } from './step-exporter.js';
 
@@ -213,5 +214,158 @@ describe('StepExporter', () => {
     expect(decode(result.content)).not.toContain("#114=IFCPROPERTYSET('3wkd_mjInDCfOthy7w_A6V'");
     expect(decode(result.content)).not.toMatch(/IFCRELDEFINESBYPROPERTIES\([^;]*\(#67\),#/);
     expect(decode(result.content)).toMatch(/#67=IFCWALLTYPE\([^;]*\(#72,#\d+\)[^;]*\);/);
+  });
+
+  it('creates IfcProjectedCRS and IfcMapConversion from scratch when georeferencing is added', async () => {
+    const parser = new IfcParser();
+    const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
+    const exporter = new StepExporter(store);
+
+    const result = exporter.export({
+      schema: 'IFC4',
+      applyMutations: true,
+      georefMutations: {
+        projectedCRS: {
+          name: 'EPSG:2056',
+          description: 'CH1903+ / LV95',
+          geodeticDatum: 'CH1903+',
+          mapProjection: 'Swiss Oblique Mercator 1995',
+          mapUnit: 'METRE',
+        },
+        mapConversion: {
+          eastings: 2600000,
+          northings: 1200000,
+          orthogonalHeight: 500,
+          xAxisAbscissa: 0,
+          xAxisOrdinate: 1,
+          scale: 1,
+        },
+      },
+    });
+
+    const content = decode(result.content);
+    expect(content).toContain("IFCPROJECTEDCRS('EPSG:2056','CH1903+ / LV95','CH1903+',$,'Swiss Oblique Mercator 1995',$,#");
+    expect(content).toMatch(/IFCMAPCONVERSION\(#14,#\d+,2600000\.,1200000\.,500\.,0\.,1\.,1\.\);/);
+    expect(content).toContain('IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)');
+  });
+
+  it('prefers the 3D model representation context when creating IfcMapConversion', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('g',$,'Project',$,$,$,$,(#10,#20),#30);"],
+      [10, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Plan',2,1.E-05,#11,$);"],
+      [11, 'IFCAXIS2PLACEMENT2D', "#11=IFCAXIS2PLACEMENT2D(#12,#13);"],
+      [12, 'IFCCARTESIANPOINT', '#12=IFCCARTESIANPOINT((0.,0.));'],
+      [13, 'IFCDIRECTION', '#13=IFCDIRECTION((1.,0.));'],
+      [20, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#20=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#21,$);"],
+      [21, 'IFCAXIS2PLACEMENT3D', "#21=IFCAXIS2PLACEMENT3D(#22,#23,#24);"],
+      [22, 'IFCCARTESIANPOINT', '#22=IFCCARTESIANPOINT((0.,0.,0.));'],
+      [23, 'IFCDIRECTION', '#23=IFCDIRECTION((0.,0.,1.));'],
+      [24, 'IFCDIRECTION', '#24=IFCDIRECTION((1.,0.,0.));'],
+      [30, 'IFCUNITASSIGNMENT', '#30=IFCUNITASSIGNMENT(());'],
+    ]);
+
+    const exporter = new StepExporter(dataStore);
+    const result = exporter.export({
+      schema: 'IFC4',
+      applyMutations: true,
+      georefMutations: {
+        projectedCRS: { name: 'EPSG:2056', mapUnit: 'METRE' },
+        mapConversion: { eastings: 2600000, northings: 1200000, orthogonalHeight: 500, xAxisAbscissa: 1, xAxisOrdinate: 0, scale: 1 },
+      },
+    });
+
+    expect(decode(result.content)).toMatch(/IFCMAPCONVERSION\(#20,#\d+,2600000\.,1200000\.,500\.,1\.,0\.,1\.\);/);
+  });
+
+  it('rejects georeferencing edits for IFC2X3 export', async () => {
+    const parser = new IfcParser();
+    const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
+    const exporter = new StepExporter(store);
+
+    expect(() => exporter.export({
+      schema: 'IFC2X3',
+      applyMutations: true,
+      georefMutations: {
+        projectedCRS: { name: 'EPSG:2056' },
+      },
+    })).toThrow(/IFC4 or newer/);
+  });
+
+  it('reuses the project length unit when exporting property units', async () => {
+    const parser = new IfcParser();
+    const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
+    const mutations: Mutation[] = [{
+      id: 'mut_unit_1',
+      type: 'CREATE_PROPERTY',
+      timestamp: Date.now(),
+      modelId: 'test-model',
+      entityId: 74,
+      psetName: 'Pset_Custom',
+      propName: 'OffsetDistance',
+      newValue: 12.5,
+      valueType: PropertyValueType.Real,
+    }];
+
+    const mutationView = {
+      getMutations: () => mutations,
+      getForEntity: (entityId: number) => entityId === 74 ? [{
+        name: 'Pset_Custom',
+        globalId: 'test-pset',
+        properties: [{
+          name: 'OffsetDistance',
+          type: PropertyValueType.Real,
+          value: 12.5,
+          unit: 'METRE',
+        }],
+      }] : [],
+      getQuantitiesForEntity: () => [],
+    } as unknown as MutablePropertyView;
+
+    const exporter = new StepExporter(store, mutationView);
+    const result = exporter.export({ schema: 'IFC4', applyMutations: true });
+    const content = decode(result.content);
+
+    expect(content).not.toContain(',#0);');
+    expect(content).toMatch(/#\d+=IFCPROPERTYSINGLEVALUE\('OffsetDistance',\$,IFCREAL\(12\.5\),#\d+\);/);
+  });
+
+  it('generates valid IFC GlobalIds for new STEP entities', async () => {
+    const parser = new IfcParser();
+    const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
+    const mutations: Mutation[] = [{
+      id: 'mut_guid_1',
+      type: 'CREATE_PROPERTY',
+      timestamp: Date.now(),
+      modelId: 'test-model',
+      entityId: 74,
+      psetName: 'Pset_GUID_Check',
+      propName: 'Marker',
+      newValue: 'ok',
+      valueType: PropertyValueType.Label,
+    }];
+
+    const mutationView = {
+      getMutations: () => mutations,
+      getForEntity: (entityId: number) => entityId === 74 ? [{
+        name: 'Pset_GUID_Check',
+        globalId: '',
+        properties: [{
+          name: 'Marker',
+          type: PropertyValueType.Label,
+          value: 'ok',
+        }],
+      }] : [],
+      getQuantitiesForEntity: () => [],
+    } as unknown as MutablePropertyView;
+
+    const exporter = new StepExporter(store, mutationView);
+    const result = exporter.export({ schema: 'IFC4', applyMutations: true });
+    const content = decode(result.content);
+    const guids = Array.from(content.matchAll(/IFC(?:PROPERTYSET|RELDEFINESBYPROPERTIES)\('([^']+)'/g)).map((match) => match[1]);
+
+    expect(guids.length).toBeGreaterThan(0);
+    for (const guid of guids) {
+      expect(isValidIfcGuid(guid)).toBe(true);
+    }
   });
 });

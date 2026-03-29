@@ -17,10 +17,13 @@ import {
   serializeValue,
   ref,
   type StepValue,
+  type MapConversion,
+  type ProjectedCRS,
 } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import type { PropertySet, Property, QuantitySet } from '@ifc-lite/data';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
+import { generateIfcGuid } from '@ifc-lite/encoding';
 import { collectReferencedEntityIds, getVisibleEntityIds, collectStyleEntities } from './reference-collector.js';
 import { convertStepLine, needsConversion, type IfcSchemaVersion } from './schema-converter.js';
 
@@ -61,6 +64,12 @@ export interface StepExportOptions {
   hiddenEntityIds?: Set<number>;
   /** Isolated entity IDs (local expressIds, null = no isolation active) */
   isolatedEntityIds?: Set<number> | null;
+
+  /** Georeferencing mutations to apply (IfcProjectedCRS / IfcMapConversion edits) */
+  georefMutations?: {
+    projectedCRS?: Partial<ProjectedCRS>;
+    mapConversion?: Partial<MapConversion>;
+  };
 
   /** Progress callback for async export */
   onProgress?: (progress: StepExportProgress) => void;
@@ -129,6 +138,18 @@ export class StepExporter {
     const sourceSchema = (this.dataStore.schemaVersion as IfcSchemaVersion) || 'IFC4';
     const converting = needsConversion(sourceSchema, schema);
 
+    if (
+      schema === 'IFC2X3' &&
+      options.applyMutations !== false &&
+      options.georefMutations &&
+      (
+        Object.keys(options.georefMutations.projectedCRS ?? {}).length > 0 ||
+        Object.keys(options.georefMutations.mapConversion ?? {}).length > 0
+      )
+    ) {
+      throw new Error('Georeferencing creation and editing requires IFC4 or newer. IFC2X3 does not support IfcProjectedCRS or IfcMapConversion.');
+    }
+
     // Generate header
     const header = generateHeader({
       schema,
@@ -193,7 +214,7 @@ export class StepExporter {
 
         // Get the FULL mutated property sets for this entity (merged base + mutations)
         const allPsets = this.mutationView.getForEntity(entityId);
-        const relevantPsets = allPsets.filter(pset => psetNames.has(pset.name));
+        const relevantPsets = allPsets.filter((pset: PropertySet) => psetNames.has(pset.name));
         const relDefinedPsetNames = new Set<string>();
 
         if (relevantPsets.length > 0) {
@@ -264,7 +285,7 @@ export class StepExporter {
         if (!modifiedPsets.has(entityId)) modifiedEntityCount++;
 
         const allQsets = this.mutationView.getQuantitiesForEntity(entityId);
-        const relevantQsets = allQsets.filter(qset => qsetNames.has(qset.name));
+        const relevantQsets = allQsets.filter((qset: QuantitySet) => qsetNames.has(qset.name));
 
         if (relevantQsets.length > 0) {
           newQuantitySets.push({ entityId, qsets: relevantQsets });
@@ -295,6 +316,115 @@ export class StepExporter {
       for (const [entityId] of modifiedAttributes) {
         if (!entityPropMutations.has(entityId) && !entityQuantMutations.has(entityId)) {
           modifiedEntityCount++;
+        }
+      }
+    }
+
+    // Process georeferencing mutations (only when applyMutations is enabled)
+    const newGeorefLines: string[] = [];
+    if (options.applyMutations !== false && options.georefMutations) {
+      const gm = options.georefMutations;
+      const existingCrsIds = this.dataStore.entityIndex.byType.get('IFCPROJECTEDCRS');
+      const existingMcIds = this.dataStore.entityIndex.byType.get('IFCMAPCONVERSION');
+
+      // Modify existing IfcProjectedCRS
+      if (gm.projectedCRS && existingCrsIds?.length) {
+        const entityId = existingCrsIds[0];
+        if (!modifiedAttributes.has(entityId)) {
+          modifiedAttributes.set(entityId, new Map());
+        }
+        const attrMap = modifiedAttributes.get(entityId)!;
+        const crs = gm.projectedCRS;
+        let changed = false;
+        if (crs.name !== undefined) { attrMap.set('Name', String(crs.name)); changed = true; }
+        if (crs.description !== undefined) { attrMap.set('Description', String(crs.description)); changed = true; }
+        if (crs.geodeticDatum !== undefined) { attrMap.set('GeodeticDatum', String(crs.geodeticDatum)); changed = true; }
+        if (crs.verticalDatum !== undefined) { attrMap.set('VerticalDatum', String(crs.verticalDatum)); changed = true; }
+        if (crs.mapProjection !== undefined) { attrMap.set('MapProjection', String(crs.mapProjection)); changed = true; }
+        if (crs.mapZone !== undefined) { attrMap.set('MapZone', String(crs.mapZone)); changed = true; }
+        if (crs.mapUnit !== undefined) {
+          const mapUnitRef = this.resolveMapUnitReference(String(crs.mapUnit), newGeorefLines);
+          attrMap.set('MapUnit', `#${mapUnitRef}`);
+          changed = true;
+        }
+        if (changed && !modifiedEntities.has(entityId)) {
+          modifiedEntities.add(entityId);
+          modifiedEntityCount++;
+        }
+      }
+
+      // Modify existing IfcMapConversion
+      if (gm.mapConversion && existingMcIds?.length) {
+        const entityId = existingMcIds[0];
+        if (!modifiedAttributes.has(entityId)) {
+          modifiedAttributes.set(entityId, new Map());
+        }
+        const attrMap = modifiedAttributes.get(entityId)!;
+        const mc = gm.mapConversion;
+        let changed = false;
+        if (mc.eastings !== undefined) { attrMap.set('Eastings', String(mc.eastings)); changed = true; }
+        if (mc.northings !== undefined) { attrMap.set('Northings', String(mc.northings)); changed = true; }
+        if (mc.orthogonalHeight !== undefined) { attrMap.set('OrthogonalHeight', String(mc.orthogonalHeight)); changed = true; }
+        if (mc.xAxisAbscissa !== undefined) { attrMap.set('XAxisAbscissa', String(mc.xAxisAbscissa)); changed = true; }
+        if (mc.xAxisOrdinate !== undefined) { attrMap.set('XAxisOrdinate', String(mc.xAxisOrdinate)); changed = true; }
+        if (mc.scale !== undefined) { attrMap.set('Scale', String(mc.scale)); changed = true; }
+        if (changed && !modifiedEntities.has(entityId)) {
+          modifiedEntities.add(entityId);
+          modifiedEntityCount++;
+        }
+      }
+
+      // CREATE new georef entities when file has none
+      if (gm.projectedCRS && !existingCrsIds?.length) {
+        const crs = gm.projectedCRS;
+        const crsId = this.nextExpressId++;
+        // IfcProjectedCRS(Name, Description, GeodeticDatum, VerticalDatum, MapProjection, MapZone, MapUnit)
+        const name = crs.name ? `'${this.escapeStepString(String(crs.name))}'` : '$';
+        const desc = crs.description ? `'${this.escapeStepString(String(crs.description))}'` : '$';
+        const datum = crs.geodeticDatum ? `'${this.escapeStepString(String(crs.geodeticDatum))}'` : '$';
+        const vDatum = crs.verticalDatum ? `'${this.escapeStepString(String(crs.verticalDatum))}'` : '$';
+        const proj = crs.mapProjection ? `'${this.escapeStepString(String(crs.mapProjection))}'` : '$';
+        const zone = crs.mapZone ? `'${this.escapeStepString(String(crs.mapZone))}'` : '$';
+        const mapUnitRef = crs.mapUnit
+          ? `#${this.resolveMapUnitReference(String(crs.mapUnit), newGeorefLines)}`
+          : '$';
+        newGeorefLines.push(`#${crsId}=IFCPROJECTEDCRS(${name},${desc},${datum},${vDatum},${proj},${zone},${mapUnitRef});`);
+        newEntityCount++;
+
+        // Find IfcGeometricRepresentationContext as SourceCRS for MapConversion
+        const contextId = this.findPreferredGeometricRepresentationContextId();
+
+        if (contextId) {
+          const mc = gm.mapConversion || {};
+          const mcId = this.nextExpressId++;
+          const eastings = this.toStepReal(Number(mc.eastings) || 0);
+          const northings = this.toStepReal(Number(mc.northings) || 0);
+          const height = this.toStepReal(Number(mc.orthogonalHeight) || 0);
+          const abscissa = mc.xAxisAbscissa !== undefined ? this.toStepReal(Number(mc.xAxisAbscissa)) : '$';
+          const ordinate = mc.xAxisOrdinate !== undefined ? this.toStepReal(Number(mc.xAxisOrdinate)) : '$';
+          const scale = mc.scale !== undefined ? this.toStepReal(Number(mc.scale)) : '$';
+          // IfcMapConversion(SourceCRS, TargetCRS, Eastings, Northings, OrthogonalHeight, XAxisAbscissa, XAxisOrdinate, Scale)
+          newGeorefLines.push(`#${mcId}=IFCMAPCONVERSION(#${contextId},#${crsId},${eastings},${northings},${height},${abscissa},${ordinate},${scale});`);
+          newEntityCount++;
+        } else {
+          console.warn('[StepExporter] Cannot create IfcMapConversion: no IfcGeometricRepresentationContext found in source file');
+        }
+      } else if (gm.mapConversion && !existingMcIds?.length && existingCrsIds?.length) {
+        // CRS exists but no MapConversion — create just the conversion
+        const contextId = this.findPreferredGeometricRepresentationContextId();
+        if (contextId) {
+          const mc = gm.mapConversion;
+          const mcId = this.nextExpressId++;
+          const eastings = this.toStepReal(Number(mc.eastings) || 0);
+          const northings = this.toStepReal(Number(mc.northings) || 0);
+          const height = this.toStepReal(Number(mc.orthogonalHeight) || 0);
+          const abscissa = mc.xAxisAbscissa !== undefined ? this.toStepReal(Number(mc.xAxisAbscissa)) : '$';
+          const ordinate = mc.xAxisOrdinate !== undefined ? this.toStepReal(Number(mc.xAxisOrdinate)) : '$';
+          const scale = mc.scale !== undefined ? this.toStepReal(Number(mc.scale)) : '$';
+          newGeorefLines.push(`#${mcId}=IFCMAPCONVERSION(#${contextId},#${existingCrsIds[0]},${eastings},${northings},${height},${abscissa},${ordinate},${scale});`);
+          newEntityCount++;
+        } else {
+          console.warn('[StepExporter] Cannot create IfcMapConversion: no IfcGeometricRepresentationContext found in source file');
         }
       }
     }
@@ -437,6 +567,11 @@ export class StepExporter {
       entities.push(rewrittenLine);
     }
 
+    // Add new georeferencing entities (IfcProjectedCRS, IfcMapConversion)
+    for (const line of newGeorefLines) {
+      entities.push(line);
+    }
+
     // Assemble final file as Uint8Array chunks to avoid V8 string length limit
     const content = assembleStepBytes(header, entities);
 
@@ -508,7 +643,8 @@ export class StepExporter {
         count++;
 
         const valueStr = this.serializePropertyValue(prop.value, prop.type);
-        const unitStr = prop.unit ? ref(this.findUnitId(prop.unit)) : null;
+        const unitId = prop.unit ? this.findUnitId(prop.unit) : null;
+        const unitStr = unitId !== null ? ref(unitId) : null;
 
         // #ID=IFCPROPERTYSINGLEVALUE('Name',$,Value,Unit);
         const line = `#${propId}=IFCPROPERTYSINGLEVALUE('${this.escapeStepString(prop.name)}',$,${valueStr},${unitStr ? serializeValue(unitStr) : '$'});`;
@@ -769,6 +905,118 @@ export class StepExporter {
     return parts;
   }
 
+  private resolveMapUnitReference(unitName: string, newGeorefLines: string[]): number {
+    const normalized = this.normalizeMapUnitName(unitName);
+    const existing = this.findLengthUnitReference(normalized);
+    if (existing !== null) {
+      return existing;
+    }
+
+    if (normalized === 'METRE') {
+      const unitId = this.nextExpressId++;
+      newGeorefLines.push(`#${unitId}=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);`);
+      return unitId;
+    }
+
+    if (normalized === 'FOOT' || normalized === 'US SURVEY FOOT') {
+      const dimId = this.nextExpressId++;
+      const siUnitId = this.nextExpressId++;
+      const measureId = this.nextExpressId++;
+      const convUnitId = this.nextExpressId++;
+      const factor = normalized === 'US SURVEY FOOT' ? 1200 / 3937 : 0.3048;
+      const name = normalized === 'US SURVEY FOOT' ? 'US SURVEY FOOT' : 'FOOT';
+      newGeorefLines.push(`#${dimId}=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);`);
+      newGeorefLines.push(`#${siUnitId}=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);`);
+      newGeorefLines.push(`#${measureId}=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(${this.toStepReal(factor)}),#${siUnitId});`);
+      newGeorefLines.push(`#${convUnitId}=IFCCONVERSIONBASEDUNIT(#${dimId},.LENGTHUNIT.,'${name}',#${measureId});`);
+      return convUnitId;
+    }
+
+    const fallbackId = this.nextExpressId++;
+    newGeorefLines.push(`#${fallbackId}=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);`);
+    return fallbackId;
+  }
+
+  private normalizeMapUnitName(unitName: string): string {
+    const normalized = unitName.trim().toUpperCase().replace(/\s+/g, ' ');
+    if (normalized.includes('US SURVEY FOOT')) return 'US SURVEY FOOT';
+    if (normalized.includes('METER') || normalized.includes('METRE')) return 'METRE';
+    if (normalized.includes('FOOT') || normalized.includes('FEET')) return 'FOOT';
+    return normalized;
+  }
+
+  private findLengthUnitReference(preferredUnitName: string): number | null {
+    if (!this.entityExtractor) return null;
+
+    const projectIds = this.dataStore.entityIndex.byType.get('IFCPROJECT') ?? [];
+    const projectRef = projectIds[0] ? this.dataStore.entityIndex.byId.get(projectIds[0]) : undefined;
+    const project = projectRef ? this.entityExtractor.extractEntity(projectRef) : null;
+    const unitAssignmentId = project?.attributes?.[8];
+    if (typeof unitAssignmentId !== 'number') return null;
+
+    const unitAssignmentRef = this.dataStore.entityIndex.byId.get(unitAssignmentId);
+    const unitAssignment = unitAssignmentRef ? this.entityExtractor.extractEntity(unitAssignmentRef) : null;
+    const units = unitAssignment?.attributes?.[0];
+    if (!Array.isArray(units)) return null;
+
+    for (const unitId of units) {
+      if (typeof unitId !== 'number') continue;
+      const unitRef = this.dataStore.entityIndex.byId.get(unitId);
+      const unit = unitRef ? this.entityExtractor.extractEntity(unitRef) : null;
+      if (!unit) continue;
+
+      const typeName = unit.type.toUpperCase();
+      const attrs = unit.attributes ?? [];
+      const unitType = typeof attrs[1] === 'string' ? attrs[1].replace(/\./g, '').toUpperCase() : '';
+      if (unitType !== 'LENGTHUNIT') continue;
+
+      if (typeName === 'IFCSIUNIT') {
+        const prefix = typeof attrs[2] === 'string' ? attrs[2].replace(/\./g, '').toUpperCase() : '';
+        const name = typeof attrs[3] === 'string' ? attrs[3].replace(/\./g, '').toUpperCase() : '';
+        const combined = prefix ? `${prefix}${name}` : name;
+        if (preferredUnitName === 'METRE' && (combined === 'METRE' || combined === 'METER')) {
+          return unitId;
+        }
+      }
+
+      if (typeName === 'IFCCONVERSIONBASEDUNIT') {
+        const name = typeof attrs[2] === 'string' ? this.normalizeMapUnitName(attrs[2]) : '';
+        if (name === preferredUnitName) {
+          return unitId;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private findPreferredGeometricRepresentationContextId(): number | null {
+    if (!this.entityExtractor) return null;
+
+    const contextIds = this.dataStore.entityIndex.byType.get('IFCGEOMETRICREPRESENTATIONCONTEXT') ?? [];
+    let first3dContext: number | null = null;
+
+    for (const contextId of contextIds) {
+      const contextRef = this.dataStore.entityIndex.byId.get(contextId);
+      const context = contextRef ? this.entityExtractor.extractEntity(contextRef) : null;
+      if (!context) continue;
+
+      const attrs = context.attributes ?? [];
+      const contextType = typeof attrs[1] === 'string' ? attrs[1].trim().toUpperCase() : '';
+      const dimension = typeof attrs[2] === 'number' ? attrs[2] : null;
+
+      if (dimension === 3 && first3dContext === null) {
+        first3dContext = contextId;
+      }
+
+      if (contextType === 'MODEL' && dimension === 3) {
+        return contextId;
+      }
+    }
+
+    return first3dContext ?? contextIds[0] ?? null;
+  }
+
   /**
    * Convert a number to a valid STEP REAL literal.
    * Handles NaN/Infinity (→ 0.) and ensures a decimal point is present.
@@ -792,12 +1040,7 @@ export class StepExporter {
    * Generate a new IFC GlobalId (22 character base64)
    */
   private generateGlobalId(): string {
-    const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$';
-    let result = '';
-    for (let i = 0; i < 22; i++) {
-      result += chars[Math.floor(Math.random() * 64)];
-    }
-    return result;
+    return generateIfcGuid();
   }
 
   /**
@@ -814,9 +1057,8 @@ export class StepExporter {
   /**
    * Find a unit entity ID by name (simplified - returns null for now)
    */
-  private findUnitId(_unitName: string): number {
-    // TODO: Implement unit lookup from data store
-    return 0;
+  private findUnitId(unitName: string): number | null {
+    return this.findLengthUnitReference(this.normalizeMapUnitName(unitName));
   }
 
   /**

@@ -27,11 +27,12 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store';
+import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { IfcQuery } from '@ifc-lite/query';
 import { MutablePropertyView } from '@ifc-lite/mutations';
-import { extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import { extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGeoreferencingOnDemand, type IfcDataStore } from '@ifc-lite/parser';
 import { EntityFlags, RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
 import type { EntityRef, FederatedModel } from '@/store/types';
 
@@ -45,6 +46,7 @@ import { DocumentCard } from './properties/DocumentCard';
 import { RelationshipsCard } from './properties/RelationshipsCard';
 import type { PropertySet, QuantitySet } from './properties/encodingUtils';
 import { BsddCard } from './properties/BsddCard';
+import { GeoreferencingPanel } from './properties/GeoreferencingPanel';
 
 type DisplayProperty = { name: string; value: unknown; isMutated: boolean };
 type DisplayPropertySet = {
@@ -247,7 +249,7 @@ export function PropertiesPanel() {
     if (!geoResult?.meshes?.length) return null;
 
     // In multi-model mode, meshes use globalIds (originalExpressId + idOffset)
-    const targetExpressId = selectedEntity.expressId + (model?.idOffset ?? 0);
+    const targetExpressId = toGlobalIdFromModels(models, selectedEntity.modelId, selectedEntity.expressId);
 
     // Compute bounding box from matching mesh positions
     let minX = Infinity, minY = Infinity, minZ = Infinity;
@@ -515,6 +517,14 @@ export function PropertiesPanel() {
     return totalCount > 0 ? rels : null;
   }, [selectedEntity, model, ifcDataStore]);
 
+  // Extract georeferencing info for the model (used in coordinates section)
+  const georef = useMemo(() => {
+    const dataStore = model?.ifcDataStore ?? ifcDataStore;
+    if (!dataStore) return null;
+    const info = extractGeoreferencingOnDemand(dataStore as IfcDataStore);
+    return info?.hasGeoreference ? info : null;
+  }, [model, ifcDataStore]);
+
   // Extract type-level properties (e.g., from IfcWallType's HasPropertySets)
   const typeProperties = useMemo(() => {
     if (!selectedEntity) return null;
@@ -770,6 +780,23 @@ export function PropertiesPanel() {
   }
 
   if (!selectedEntityId || !modelQuery || !entityNode) {
+    // Show model metadata when a single legacy model is loaded and nothing selected
+    if (ifcDataStore && models.size === 0 && geometryResult) {
+      const legacyModel: FederatedModel = {
+        id: '__legacy__',
+        name: 'Model',
+        ifcDataStore: ifcDataStore as IfcDataStore,
+        geometryResult,
+        visible: true,
+        collapsed: false,
+        schemaVersion: ((ifcDataStore as IfcDataStore).schemaVersion ?? 'IFC4') as FederatedModel['schemaVersion'],
+        loadedAt: Date.now(),
+        fileSize: (ifcDataStore as IfcDataStore).fileSize ?? 0,
+        idOffset: 0,
+        maxExpressId: (ifcDataStore as IfcDataStore).entityCount ?? 0,
+      };
+      return <ModelMetadataPanel model={legacyModel} />;
+    }
     return (
       <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
         <div className="p-3 border-b-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
@@ -781,7 +808,7 @@ export function PropertiesPanel() {
           </div>
           <p className="font-bold uppercase text-zinc-900 dark:text-zinc-100 mb-2">No Selection</p>
           <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 max-w-[150px]">
-            Select an element to view details
+            {models.size > 1 ? 'Select a model or element to view details' : 'Select an element to view details'}
           </p>
         </div>
       </div>
@@ -932,55 +959,68 @@ export function PropertiesPanel() {
           </div>
         )}
 
-        {/* Entity Position - teal tint to distinguish from emerald storey bar */}
-        {entityCoordinates && (
+        {/* World coordinates + Georeferencing — single consolidated section */}
+        {(entityCoordinates || georef || editMode) && (
           <Collapsible open={coordOpen} onOpenChange={setCoordOpen}>
             <CollapsibleTrigger className="flex items-center gap-2 w-full text-xs border border-teal-500/30 px-2 py-1.5 text-teal-800 dark:text-teal-400 min-w-0 text-left group/coord">
               <Crosshair className="h-3.5 w-3.5 shrink-0" />
               <span className="font-bold uppercase tracking-wide shrink-0">World</span>
               {!coordOpen && (
                 <>
-                  <span className="font-mono text-[10px] text-teal-600/70 dark:text-teal-500/70 truncate min-w-0 flex-1 tabular-nums">
-                    <CoordVal axis="E" value={entityCoordinates.worldZup.center.x} />{' '}
-                    <CoordVal axis="N" value={entityCoordinates.worldZup.center.y} />{' '}
-                    <CoordVal axis="Z" value={entityCoordinates.worldZup.center.z} />
-                  </span>
+                  {entityCoordinates && (
+                    <span className="font-mono text-[10px] text-teal-600/70 dark:text-teal-500/70 truncate min-w-0 flex-1 tabular-nums">
+                      <CoordVal axis="E" value={entityCoordinates.worldZup.center.x} />{' '}
+                      <CoordVal axis="N" value={entityCoordinates.worldZup.center.y} />{' '}
+                      <CoordVal axis="Z" value={entityCoordinates.worldZup.center.z} />
+                    </span>
+                  )}
+                  {georef?.projectedCRS?.name && (
+                    <span className="font-mono text-[9px] text-teal-500/60 shrink-0">{georef.projectedCRS.name}</span>
+                  )}
                   <span className="text-[9px] text-teal-500/0 group-hover/coord:text-teal-500/40 transition-colors shrink-0">details</span>
                 </>
               )}
             </CollapsibleTrigger>
             <CollapsibleContent>
-              <div className="px-2 py-1.5 space-y-0.5">
-                <CoordRow
-                  label=""
-                  values={[
-                    { axis: 'E', value: entityCoordinates.worldZup.center.x },
-                    { axis: 'N', value: entityCoordinates.worldZup.center.y },
-                    { axis: 'Z', value: entityCoordinates.worldZup.center.z },
-                  ]}
-                  primary
-                  copyLabel="world"
-                  coordCopied={coordCopied}
-                  onCopy={copyCoords}
-                />
-                <CoordRow
-                  label="Local"
-                  values={[
-                    { axis: 'X', value: entityCoordinates.local.center.x },
-                    { axis: 'Y', value: entityCoordinates.local.center.y },
-                    { axis: 'Z', value: entityCoordinates.local.center.z },
-                  ]}
-                  copyLabel="local"
-                  coordCopied={coordCopied}
-                  onCopy={copyCoords}
-                />
-                <div className="flex items-start gap-1.5">
-                  <span className="text-[9px] font-medium text-muted-foreground/50 uppercase tracking-wider w-[34px] shrink-0 pt-px">Size</span>
-                  <span className="font-mono text-[10px] text-muted-foreground/50 tabular-nums">
-                    {(entityCoordinates.local.max.x - entityCoordinates.local.min.x).toFixed(2)} x {(entityCoordinates.local.max.y - entityCoordinates.local.min.y).toFixed(2)} x {(entityCoordinates.local.max.z - entityCoordinates.local.min.z).toFixed(2)}
-                  </span>
+              {entityCoordinates && (
+                <div className="px-2 py-1.5 space-y-0.5">
+                  <CoordRow
+                    label=""
+                    values={[
+                      { axis: 'E', value: entityCoordinates.worldZup.center.x },
+                      { axis: 'N', value: entityCoordinates.worldZup.center.y },
+                      { axis: 'Z', value: entityCoordinates.worldZup.center.z },
+                    ]}
+                    primary
+                    copyLabel="world"
+                    coordCopied={coordCopied}
+                    onCopy={copyCoords}
+                  />
+                  <CoordRow
+                    label="Local"
+                    values={[
+                      { axis: 'X', value: entityCoordinates.local.center.x },
+                      { axis: 'Y', value: entityCoordinates.local.center.y },
+                      { axis: 'Z', value: entityCoordinates.local.center.z },
+                    ]}
+                    copyLabel="local"
+                    coordCopied={coordCopied}
+                    onCopy={copyCoords}
+                  />
+                  <div className="flex items-start gap-1.5">
+                    <span className="text-[9px] font-medium text-muted-foreground/50 uppercase tracking-wider w-[34px] shrink-0 pt-px">Size</span>
+                    <span className="font-mono text-[10px] text-muted-foreground/50 tabular-nums">
+                      {(entityCoordinates.local.max.x - entityCoordinates.local.min.x).toFixed(2)} x {(entityCoordinates.local.max.y - entityCoordinates.local.min.y).toFixed(2)} x {(entityCoordinates.local.max.z - entityCoordinates.local.min.z).toFixed(2)}
+                    </span>
+                  </div>
                 </div>
-              </div>
+              )}
+              <GeoreferencingPanel
+                georef={georef}
+                modelId={selectedEntity?.modelId === 'legacy' ? '__legacy__' : (model?.id ?? selectedEntity?.modelId)}
+                enableEditing
+                schemaVersion={activeDataStore?.schemaVersion}
+              />
             </CollapsibleContent>
           </Collapsible>
         )}

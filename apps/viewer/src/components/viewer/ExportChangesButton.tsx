@@ -24,6 +24,13 @@ interface ExportChangesButtonProps {
   className?: string;
 }
 
+function toBlobPart(content: string | Uint8Array): BlobPart {
+  if (typeof content === 'string') return content;
+  const bytes = new Uint8Array(content.byteLength);
+  bytes.set(content);
+  return bytes;
+}
+
 export function ExportChangesButton({ className }: ExportChangesButtonProps) {
   const models = useViewerStore((s) => s.models);
   const getMutationView = useViewerStore((s) => s.getMutationView);
@@ -63,11 +70,17 @@ export function ExportChangesButton({ className }: ExportChangesButtonProps) {
     return null;
   }, [models, legacyIfcDataStore, legacyGeometryResult]);
 
-  // Count mutations
+  // Count mutations (includes georef mutations)
   const mutationCount = useMemo(() => {
     if (!modelInfo) return 0;
     const mutationView = getMutationView(modelInfo.id);
-    return mutationView?.getMutations().length || 0;
+    let count = mutationView?.getMutations().length || 0;
+    const gm = useViewerStore.getState().georefMutations?.get(modelInfo.id);
+    if (gm) {
+      if (gm.projectedCRS) count += Object.keys(gm.projectedCRS).length;
+      if (gm.mapConversion) count += Object.keys(gm.mapConversion).length;
+    }
+    return count;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modelInfo, getMutationView, mutationVersion]);
 
@@ -119,17 +132,19 @@ export function ExportChangesButton({ className }: ExportChangesButtonProps) {
                    : 'IFC4';
 
       const exporter = new StepExporter(modelInfo.ifcDataStore, mutationView || undefined);
+      const georefMutations = useViewerStore.getState().georefMutations?.get(modelInfo.id) ?? undefined;
       const result = exporter.export({
         schema: schema as 'IFC2X3' | 'IFC4' | 'IFC4X3',
         includeGeometry: true,
         applyMutations: true,
         deltaOnly: false,
+        georefMutations,
         description: `Exported from ifc-lite with ${mutationCount} modifications`,
         application: 'ifc-lite',
       });
 
       // Download the file
-      const blob = new Blob([result.content], { type: 'text/plain' });
+      const blob = new Blob([toBlobPart(result.content)], { type: 'text/plain' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
